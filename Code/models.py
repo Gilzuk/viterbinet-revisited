@@ -1,0 +1,1344 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+import copy
+import numpy as np
+from Code.channel.channel_estimation import estimate_channel
+from Code.channel.modulator import BPSKModulator
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(device)
+
+# device = "cpu"
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding, bias): 
+        super(ConvBlock, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=bias)
+        self.relu = nn.ReLU()
+        self.bn = nn.BatchNorm1d(out_channels)
+        
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn(out)
+        out = self.relu(out)
+        return out
+
+
+class ConvUpsampleBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding, bias, activation=True):
+        super(ConvUpsampleBlock, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=bias)
+        self.bn = nn.BatchNorm1d(out_channels)
+        self.relu = nn.LeakyReLU()
+        self.activation = activation
+        
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn(out)
+        if self.activation:
+            out = self.relu(out)
+        return out
+
+
+#ResNet with 5/2 kernel/padding
+class BasicResidualUnit(nn.Module):
+    """Basic residual unit for building ResNet with 1D input"""
+    def __init__(self, in_channels, out_channels, downsample=None):
+        super(BasicResidualUnit, self).__init__()
+        self.downsample = downsample
+        
+        self.conv1 = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=5, padding=2)
+        self.batch_norm1 = nn.BatchNorm1d(out_channels)
+        self.relu1 = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv1d(in_channels=out_channels, out_channels=out_channels, kernel_size=5, padding=2)
+        self.batch_norm2 = nn.BatchNorm1d(out_channels)
+        self.relu2 = nn.ReLU(inplace=True)
+
+    def forward(self, input_tensor):
+        
+        input_tensor_copy = input_tensor
+        
+        output_tensor = self.conv1(input_tensor)
+        output_tensor = self.batch_norm1(output_tensor)
+        output_tensor = self.relu1(output_tensor)
+        
+        output_tensor = self.conv2(output_tensor)
+        output_tensor = self.batch_norm2(output_tensor)
+        
+        if self.downsample is not None:
+            self.downsample(output_tensor)
+        
+        output_tensor += input_tensor_copy
+        #output_tensor = self.relu2(output_tensor)
+        return output_tensor
+    
+class BasicResidualStack(nn.Module):
+    """Basic residual stack, made from 1x1 conv, ResUnit, ResUnit, MaxPool"""
+    def __init__(self, in_channels, out_channels, downsample=None):
+        super(BasicResidualStack, self).__init__()
+        self.downsample = downsample
+        
+        self.conv1x1 = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=1,)
+        self.basic_unit_1 = BasicResidualUnit(in_channels=out_channels, out_channels=out_channels)
+        self.basic_unit_2 = BasicResidualUnit(in_channels=out_channels, out_channels=out_channels)
+        self.maxpool = nn.MaxPool1d(kernel_size=3, stride=2, padding=1)
+        
+    def forward(self, input_tensor):
+        
+        output_tensor = self.conv1x1(input_tensor)
+        output_tensor = self.basic_unit_1(output_tensor)
+        output_tensor = self.basic_unit_2(output_tensor)
+        output_tensor = self.maxpool(output_tensor)
+        
+        return output_tensor
+
+
+class Residual1DModel(nn.Module):
+    def __init__(self, in_size, in_channels, block_sizes, num_classes):
+        super(Residual1DModel, self).__init__()
+        self.n_classes = num_classes
+        self.block_sizes = block_sizes
+        
+        self.in_size = in_size
+        num_features = in_size[1]
+        
+        self.basic_stack_1 = BasicResidualStack(in_channels, block_sizes[0], )
+        num_features /= 2
+            
+        self.basic_stack_2 = BasicResidualStack(block_sizes[0], block_sizes[1], )
+        num_features /= 2
+        
+        self.basic_stack_3 = BasicResidualStack(block_sizes[1], block_sizes[2], )
+        num_features /= 2
+        
+        if len(self.block_sizes) >= 4:
+            self.basic_stack_4 = BasicResidualStack(block_sizes[2], block_sizes[3], )
+            num_features /= 2
+        
+        if len(self.block_sizes) >= 5:
+            self.basic_stack_5 = BasicResidualStack(block_sizes[3], block_sizes[4], )
+            num_features /= 2
+            
+        if len(self.block_sizes) >= 6:
+            self.basic_stack_6 = BasicResidualStack(block_sizes[4], block_sizes[5], )
+            num_features /= 2
+                
+        self.fc_1 = nn.Linear(in_features=int(block_sizes[-1] * num_features), out_features=128, )
+        self.selu_1 = nn.SELU(inplace=True)
+        self.a_dropout_1 = nn.AlphaDropout(.1)
+        
+        self.fc_2 = nn.Linear(128, 128)
+        self.selu_2 = nn.SELU(inplace=True)
+        self.a_dropout_2 = nn.AlphaDropout(.1)
+        
+        self.fc_last = nn.Linear(128, num_classes)       
+
+    def forward(self, input_tensor):
+        
+        output_tensor = self.basic_stack_1(input_tensor)        
+        
+        #print("Here", output_tensor.shape)
+        
+        output_tensor = self.basic_stack_2(output_tensor)        
+        output_tensor = self.basic_stack_3(output_tensor)
+        if len(self.block_sizes) >= 4: output_tensor = self.basic_stack_4(output_tensor)
+        if len(self.block_sizes) >= 5: output_tensor = self.basic_stack_5(output_tensor)
+        if len(self.block_sizes) >= 6: output_tensor = self.basic_stack_6(output_tensor)
+            
+        output_tensor = self.fc_1(torch.flatten(output_tensor, 1))
+        output_tensor = self.selu_1(output_tensor)
+        output_tensor = self.a_dropout_1(output_tensor)
+        
+        output_tensor = self.fc_2(output_tensor)
+        output_tensor = self.selu_2(output_tensor)
+        output_tensor = self.a_dropout_2(output_tensor)
+        
+        output_tensor = self.fc_last(output_tensor)  
+        
+        return output_tensor
+
+
+class EncoderConv(nn.Module):
+    def __init__(self, input_samples: int, dim: int, n_classes: int, debug=False):
+        super().__init__()
+        self.n_classes = n_classes
+        self.input_size = input_samples
+        dropout = 0
+        self.debug = debug
+
+        self.encoder = nn.Sequential(
+            ConvBlock(1, dim // 2, 5, 2, False),
+            # nn.MaxPool1d(2),
+            ConvBlock(dim // 2, dim // 2, 5, 2, False),  # added
+            ConvBlock(dim // 2, dim, 5, 2, False),
+            # nn.MaxPool1d(2),
+            ConvBlock(dim, dim, 5, 2, False),
+            ConvBlock(dim, dim, 5, 2, False)
+        )
+
+        ff_out_size = int(dim * input_samples // 4)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(dim * int(input_samples), ff_out_size),  # input_samples/4, 1024
+            nn.BatchNorm1d(ff_out_size),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),  # 0.2
+            nn.Linear(ff_out_size, n_classes), )
+
+    def forward(self, input_):
+        z = self.encoder(input_.reshape(-1, 1, self.input_size))
+
+        if self.debug: print(z.shape)
+        y = self.classifier(z)
+        return y
+
+
+class EncoderDecoder(nn.Module):
+    def __init__(self, input_samples: int, dim: int, n_classes: int, debug=False):
+        super().__init__()
+        self.n_classes = n_classes
+        self.input_size = input_samples
+        self.debug = debug
+
+        self.encoder = nn.Sequential(
+            ConvBlock(1, dim // 8, 5, 2, False),
+            ConvBlock(dim // 8, dim // 4, 5, 2, False),
+            ConvBlock(dim//4, dim // 2, 5, 2, False),
+            ConvBlock(dim // 2, dim, 5, 2, False),
+            ConvBlock(dim, dim, 5, 2, False),
+            ConvBlock(dim, dim, 5, 2, False), )
+
+        self.decoder = nn.Sequential(
+            ConvUpsampleBlock(dim, dim // 2, 5, 2, False),
+            ConvUpsampleBlock(dim // 2, dim // 2, 5, 2, True),
+            ConvUpsampleBlock(dim // 2, dim // 4, 5, 2, True),
+            ConvUpsampleBlock(dim // 4, dim // 4, 5, 2, True),
+            ConvUpsampleBlock(dim // 4, 1, 5, 2, True, activation=False), )
+
+        self.fc_out = nn.Linear(input_samples, n_classes)
+
+    def forward(self, input_):
+        z = self.encoder(input_.reshape(-1, 1, self.input_size))
+
+        if self.debug: print(z.shape)
+
+        recon = self.decoder(z)
+
+        if self.debug: print(recon.shape)
+
+        y = self.fc_out(recon).permute(1, 0, 2)
+
+        return y
+
+
+class Basic1DResidualNet(nn.Module):
+
+    def __init__(self, in_size, out_size, in_channels, block_sizes, num_classes, dropout=0.1):
+        super(Basic1DResidualNet, self).__init__()
+        self.n_classes = num_classes
+        self.block_sizes = block_sizes
+        self.input_size = in_size[1]
+        self.dropout = dropout
+
+        self.in_size = in_size
+        num_features = in_size[1]
+
+        self.basic_stack_1 = BasicResidualStack(in_channels, block_sizes[0], )
+        num_features //= 2
+
+        self.basic_stack_2 = BasicResidualStack(block_sizes[0], block_sizes[1], )
+        num_features //= 2
+
+        # self.basic_stack_3 = BasicResidualStack(block_sizes[1], block_sizes[2], )
+        # num_features //= 2
+
+        if len(self.block_sizes) >= 4:
+            self.basic_stack_4 = BasicResidualStack(block_sizes[2], block_sizes[3], )
+            num_features /= 2
+
+        if len(self.block_sizes) >= 5:
+            self.basic_stack_5 = BasicResidualStack(block_sizes[3], block_sizes[4], )
+            num_features /= 2
+
+        if len(self.block_sizes) >= 6:
+            self.basic_stack_6 = BasicResidualStack(block_sizes[4], block_sizes[5], )
+            num_features /= 2
+
+        self.fc_1 = nn.Linear(in_features=int(block_sizes[-1] * num_features), out_features=out_size)
+        self.selu_1 = nn.SELU(inplace=True)
+        self.a_dropout_1 = nn.AlphaDropout(dropout)
+
+        self.fc_2 = nn.Linear(out_size, out_size)
+        self.selu_2 = nn.SELU(inplace=True)
+        self.a_dropout_2 = nn.AlphaDropout(dropout)
+
+        self.fc_last = nn.Linear(out_size, num_classes)
+
+    def forward(self, input_tensor):
+
+        output_tensor = self.basic_stack_1(input_tensor.reshape(-1, 1, self.input_size))
+        output_tensor = self.basic_stack_2(output_tensor)
+        # output_tensor = self.basic_stack_3(output_tensor)
+
+        if len(self.block_sizes) >= 4: output_tensor = self.basic_stack_4(output_tensor)
+        if len(self.block_sizes) >= 5: output_tensor = self.basic_stack_5(output_tensor)
+        if len(self.block_sizes) >= 6: output_tensor = self.basic_stack_6(output_tensor)
+
+        output_tensor = self.fc_1(torch.flatten(output_tensor, 1))
+        output_tensor = self.selu_1(output_tensor)
+        output_tensor = self.a_dropout_1(output_tensor)
+
+        output_tensor = self.fc_2(output_tensor)
+        output_tensor = self.selu_2(output_tensor)
+        output_tensor = self.a_dropout_2(output_tensor)
+
+        output_tensor = self.fc_last(output_tensor)
+
+        return output_tensor
+
+
+class ADNN(nn.Module):
+    def __init__(self, input_size: int, dim: int,  n_classes: int):
+        super(ADNN, self).__init__()
+        self.input_size = input_size
+        self.n_classes = n_classes
+
+        self.encoder = nn.Sequential(
+            ConvBlock(1, dim // 8, 5, 2, False),
+            # nn.MaxPool1d(2),
+            ConvBlock(dim // 8, dim // 4, 5, 2, False),
+            # nn.MaxPool1d(2),
+            ConvBlock(dim // 4, dim //2,  5, 2, False),
+            # nn.MaxPool1d(2),
+        )
+
+        self.decoder = nn.Sequential(
+            ConvUpsampleBlock(dim // 2, dim, 5, 2, False),
+            # nn.Upsample(scale_factor=2),
+            ConvUpsampleBlock(dim, dim //2, 5, 2, False),
+            # nn.Upsample(scale_factor=2),
+            ConvUpsampleBlock(dim // 2, dim // 4, 5, 2, False),
+            # nn.Upsample(scale_factor=2),
+            ConvUpsampleBlock(dim // 4, dim // 8, 5, 2, False, activation=True),
+        )
+
+
+        self.dnn = nn.Sequential( # permute to filter dim
+            nn.Flatten(),
+            # nn.Sigmoid(),
+            nn.Linear(input_size*(dim // 8), n_classes),  # input_samples/4, 1024
+        )
+        self.fc = nn.Linear(dim, 1)
+
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, input_):
+        batch_size, transmission_length = input_.size(0), input_.size(1)
+
+        z = self.encoder(input_.reshape(-1, 1, self.input_size))
+        y = self.decoder(z)
+        out = self.dnn(y.unsqueeze(1))
+        return out.reshape(batch_size, transmission_length,  self.n_classes)
+
+
+class Conv2dBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding, bias, padding_mode='circular'):
+        super(Conv2dBlock, self).__init__()
+        self.conv2 = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=padding, bias=bias, padding_mode=padding_mode)
+        self.relu = nn.ReLU()
+        self.bn = nn.BatchNorm2d(out_channels)
+
+    def forward(self, x):
+        out = self.conv2(x)
+        out = self.bn(out)
+        out = self.relu(out)
+        return out
+
+
+class ADNN2D(nn.Module):
+    def __init__(self, input_size: int, dim: int,  n_classes: int):
+        super(ADNN2D, self).__init__()
+        self.input_size = input_size
+        self.n_classes = n_classes
+
+        self.expand = nn.Sequential(ConvBlock(1, 2, kernel_size=3, padding=1, bias=False))
+        self.encoder = nn.Sequential(
+            Conv2dBlock(1, dim//8, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            # nn.MaxPool2d(2),
+            Conv2dBlock(dim//8, dim // 4, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            # nn.MaxPool2d(2),
+            Conv2dBlock(dim // 4, dim // 2, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            # nn.MaxPool2d(2),
+        )
+
+        self.decoder = nn.Sequential(
+            Conv2dBlock(dim // 2, dim, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            # nn.Upsample(scale_factor=2),
+            Conv2dBlock(dim, dim // 2, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            # nn.Upsample(scale_factor=2),
+            Conv2dBlock(dim // 2, dim // 4, kernel_size=(3, 5), padding=(1, 2), bias=False),
+            # nn.Upsample(scale_factor=2),
+            Conv2dBlock(dim // 4, dim // 8, kernel_size=(3, 5), padding=(1, 2), bias=False),
+        )
+
+        self.dnn = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(2*input_size*(dim//8), dim),
+            nn.BatchNorm1d(dim),
+            nn.ReLU(),
+            nn.Linear(dim, n_classes),
+            # nn.ReLU()
+        )
+
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(2*input_size, n_classes)
+        )
+
+    def forward(self, inp):
+        x = self.expand(inp.reshape(-1, 1, self.input_size))
+        z = self.encoder(x.unsqueeze(1))
+        y = self.decoder(z)
+        out = self.dnn(y)
+        # y = y.permute(0, 2, 3, 1)
+        # y_bar = self.dnn(y).permute(0, 3, 1, 2)
+        # out = self.fc(y_bar)
+        return out
+
+
+class DecoderConv(nn.Module):
+    def __init__(self, input_samples: int, dim: int, n_classes: int, debug=False):
+        super().__init__()
+        self.input_size = input_samples
+        self.n_classes = n_classes
+        scale = 2
+        n_up_layers = 2
+        self.debug = debug
+
+        self.decoder = nn.Sequential(
+        ConvUpsampleBlock(1, dim//2, 5, 2, False),
+        nn.Upsample(scale_factor=scale),
+        ConvUpsampleBlock(dim//2, dim//2, 5, 2, True),
+        nn.Upsample(scale_factor=scale),
+        ConvUpsampleBlock(dim//2, dim//4, 5, 2, True),
+        ConvUpsampleBlock(dim//4, dim, 5, 2, True, activation=False),)
+
+        ff_out_size = int(dim * input_samples)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(n_up_layers * scale * dim * int(input_samples), ff_out_size),  # input_samples/4, 1024
+            nn.BatchNorm1d(ff_out_size),
+            nn.ReLU(),
+            nn.Linear(ff_out_size, n_classes),
+        )
+
+    def forward(self, input_):
+        z = self.decoder(input_.reshape(-1, 1, self.input_size))
+
+        if self.debug: print(z.shape)
+        y = self.classifier(z)
+        return y
+
+
+class LSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, n_layers, n_classes):
+        super(LSTM, self).__init__()
+
+        self.num_layers = n_layers
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.n_classes = n_classes
+
+        self.lstm = nn.LSTM(input_size, hidden_size, n_layers, batch_first=True, bidirectional=False)
+        self.fc = nn.Linear(hidden_size, n_classes)
+
+    def forward(self, sequence_y: torch.Tensor) -> torch.Tensor:
+        ## LSTM Model Starts ##
+        batch_size, transmission_length = sequence_y.size(0), sequence_y.size(1)
+
+        # Set initial states
+        h_n = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(device)
+        c_n = torch.zeros(self.num_layers, batch_size,  self.hidden_size).to(device)
+
+        # Forward propagate LSTM - lstm_out: tensor of shape (batch_size, seq_length, hidden_size*2)
+        lstm_out = torch.zeros(batch_size, transmission_length, self.hidden_size).to(device)
+        for i in range(batch_size):
+            lstm_out[i], temp = self.lstm(sequence_y[i].unsqueeze(0),
+                                          (h_n[:, i].unsqueeze(1).contiguous(), c_n[:, i].unsqueeze(1).contiguous()))
+
+        # out: tensor of shape (batch_size, seq_length, N_CLASSES)
+        out = self.fc(lstm_out.reshape(-1, self.hidden_size)).reshape(batch_size, transmission_length,  self.n_classes)
+        return out
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, input_size, num_conv_channels):
+        super(ResidualBlock, self).__init__()
+        self.layer_norm_1 = nn.LayerNorm(input_size)
+        self.conv1d_1 = nn.Conv1d(num_conv_channels, num_conv_channels, kernel_size=5, padding=2, bias=False)
+        self.layer_norm_2 = nn.LayerNorm(input_size)
+        self.conv1d_2 = nn.Conv1d(num_conv_channels, num_conv_channels, kernel_size=5, padding=2, bias=False)
+        self.relu = nn.ReLU()
+
+    def forward(self, inputs):
+        z = self.layer_norm_1(inputs)  # .permute(0, 2, 1)
+        z = self.relu(z)
+        z = self.conv1d_1(z)
+        z = self.layer_norm_2(z)
+        z = self.relu(z)
+        z = self.conv1d_2(z)  # [batch size, num time samples, num subcarriers, num_channels]
+        # Skip connection
+        z = z + inputs
+        return z
+
+
+class SionnaNeuralReceiver(nn.Module):
+    def __init__(self, input_size, n_input_channels, n_output_channels, n_classes):
+        super(SionnaNeuralReceiver, self).__init__()
+        k = 2
+        self.input_size = input_size
+        self.n_input_channels = n_input_channels
+        self.n_classes = n_classes
+
+        self.input_layer = nn.Sequential(nn.Linear(input_size, k*input_size, bias=False))
+
+        self._input_conv = nn.Conv1d(n_input_channels, n_output_channels, kernel_size=5, padding=2, bias=False)
+        # Residual blocks
+        self._res_block_1 = ResidualBlock(k*input_size, n_output_channels)
+        self._res_block_2 = ResidualBlock(k*input_size, n_output_channels)
+        # self._res_block_3 = ResidualBlock(k*input_size, n_output_channels)
+        # self._res_block_4 = ResidualBlock(k*input_size, n_output_channels)
+        # Output conv
+        self._output_conv = nn.Conv1d(n_output_channels, n_classes, kernel_size=5, padding=2, bias=False)
+
+        self.fc_out = nn.Linear(k*input_size*n_classes, n_classes, bias=False)
+
+    def forward(self, inputs):
+        batch_size, transmission_length = inputs.size(0), inputs.size(1)
+        # Input conv
+        z = self._input_conv(self.input_layer(inputs.reshape(-1, self.n_input_channels, self.input_size)))
+        # Residual blocks
+        z = self._res_block_1(z)
+        z = self._res_block_2(z)
+        # z = self._res_block_3(z)
+        # z = self._res_block_4(z)
+        # Output conv
+        z = self._output_conv(z)
+        z = self.fc_out(z.reshape(batch_size, transmission_length, -1))
+        return z.reshape(batch_size, transmission_length, -1)
+
+
+class SionnaSkip(nn.Module):
+    def __init__(self, input_size, n_input_channels, n_output_channels, n_classes):
+        super(SionnaSkip, self).__init__()
+        k = 2
+        self.input_size = input_size
+        self.n_input_channels = n_input_channels
+        self.n_classes = n_classes
+
+        self.input_layer = nn.Sequential(nn.Linear(input_size, k*input_size, bias=False))
+
+        self._input_conv = nn.Conv1d(n_input_channels, n_output_channels, kernel_size=5, padding=2, bias=False)
+        # Residual blocks
+        self._res_block_1 = ResidualBlock(k*input_size, n_output_channels)
+        self._res_block_2 = ResidualBlock(k*input_size, n_output_channels)
+        self._res_block_3 = ResidualBlock(k*input_size, n_output_channels)
+        self._res_block_4 = ResidualBlock(k*input_size, n_output_channels)
+        # Output conv
+        self._output_conv = nn.Conv1d(n_output_channels, n_classes, kernel_size=5, padding=2, bias=False)
+
+        self.fc_out = nn.Linear(k*input_size*n_classes, n_classes, bias=False)
+
+    def forward(self, inputs):
+        batch_size, transmission_length = inputs.size(0), inputs.size(1)
+
+        # Input conv
+        z = self._input_conv(self.input_layer(inputs.reshape(-1, self.n_input_channels, self.input_size)))
+        # Residual blocks
+        z1 = self._res_block_1(z)
+        z2 = self._res_block_2(z+z1)
+        z3 = self._res_block_3(z+z1+z2)
+        z4 = self._res_block_4(z+z1+z2+z3)
+        # Output conv
+        out = self._output_conv(z4)
+        out = self.fc_out(out.reshape(batch_size, transmission_length, -1))
+        return out.reshape(batch_size, transmission_length, -1)
+
+
+class ConvTranspose1D(nn.Module):
+    def __init__(self, input_size: int, dim: int,  n_classes: int):
+        super(ConvTranspose1D, self).__init__()
+        self.input_size = input_size
+        self.n_classes = n_classes
+
+        self.encoder = nn.Sequential(
+            nn.ConvTranspose1d(1, dim, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Sigmoid(),
+            nn.BatchNorm1d(dim),
+            nn.ConvTranspose1d(dim, dim, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.ReLU(),
+            nn.BatchNorm1d(dim),
+            nn.ConvTranspose1d(dim, dim//2, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.ReLU(),
+            nn.BatchNorm1d(dim//2),
+            nn.ConvTranspose1d(dim//2, dim // 2, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.ReLU(),
+            nn.BatchNorm1d(dim // 2),
+        )
+
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(16 * dim//2 * input_size, n_classes)
+        )
+
+    def forward(self, input_):
+        batch_size, transmission_length = input_.size(0), input_.size(1)
+        x = self.encoder(input_.reshape(-1, 1, self.input_size))
+        out = self.fc(x)
+        return out.reshape(batch_size, transmission_length, -1)
+
+
+class FullyConnected(nn.Module):
+    def __init__(self, input_size, n_classes):
+        super(FullyConnected, self).__init__()
+        self.n_classes = n_classes
+        self.input_size = input_size
+        n_input = input_size
+        n_dense_1 = 64
+        n_dense_2 = 64
+        n_dense_3 = 64
+        n_out = n_classes
+        self.net = nn.Sequential(
+
+                    # first hidden layer:
+                    nn.Linear(n_input, n_dense_1),
+                    nn.ReLU(),
+
+                    # second hidden layer:
+                    nn.Linear(n_dense_1, n_dense_2),
+                    nn.ReLU(),
+
+                    # third hidden layer:
+                    nn.Linear(n_dense_2, n_dense_3),
+                    nn.ReLU(),
+                    # nn.Dropout(),
+
+                    # output layer:
+                    nn.Linear(n_dense_3, n_out),
+                )
+
+    def forward(self, inputs):
+        batch_size, transmission_length = inputs.size(0), inputs.size(1)
+        out = self.net(inputs.reshape(batch_size, transmission_length, self.input_size))
+        return out.reshape(batch_size, transmission_length, -1)
+
+
+class SionnaViterbiPlus(nn.Module):
+    def __init__(self, input_size, n_input_channels, n_output_channels, n_classes):
+        super(SionnaViterbiPlus, self).__init__()
+        self.n_classes = n_classes
+        self.input_size = input_size
+        self.sionna = SionnaNeuralReceiver(input_size, n_input_channels, n_output_channels, n_classes)
+        self.viterbinet = ViterbiNet(input_size, n_classes)
+        self.fc = nn.Sequential(
+            nn.Linear(2*n_classes, n_classes, bias=False)
+        )
+
+    def forward(self, input_):
+        batch_size, transmission_length = input_.size(0), input_.size(1)
+
+        out = self.sionna(input_)
+        vout = self.viterbinet(input_)
+        combined = torch.cat((out, vout), dim=-1)
+        priors = self.fc(combined)
+        return priors.reshape(batch_size, transmission_length, self.n_classes)
+
+
+class SionnaViterbiAdd(nn.Module):
+    def __init__(self, input_size, n_input_channels, n_output_channels, n_classes):
+        super(SionnaViterbiAdd, self).__init__()
+        self.n_classes = n_classes
+        self.input_size = input_size
+        self.sionna = SionnaNeuralReceiver(input_size, n_input_channels, n_output_channels, n_classes)
+        self.viterbinet = ViterbiNet(input_size, n_classes)
+
+    def forward(self, input_):
+        batch_size, transmission_length = input_.size(0), input_.size(1)
+
+        out = self.sionna(input_)
+        vout = self.viterbinet(input_)
+        priors = out + vout
+        return priors.reshape(batch_size, transmission_length, self.n_classes)
+
+
+####################################### ViterbiNet ##############################################
+HIDDEN1_SIZE = 100
+HIDDEN2_SIZE = 58
+
+class ViterbiNet(nn.Module):
+    """
+    This implements the ViterbiNet decoder by an NN on each stage
+    """
+    def __init__(self, input_size, n_classes: int):
+
+        super(ViterbiNet, self).__init__()
+        self.n_classes = n_classes
+        self.input_size = input_size
+        self.net = nn.Sequential(
+            nn.Linear(1, HIDDEN1_SIZE),
+            nn.Sigmoid(),
+            nn.Linear(HIDDEN1_SIZE, HIDDEN2_SIZE),
+            nn.ReLU(),
+            nn.Linear(HIDDEN2_SIZE, self.n_classes)
+        ).to(device)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        The forward pass of the ViterbiNet model
+        :param y: input values, size [batch_size,transmission_length]
+        :returns the estimated priors [batch_size,transmission_length,n_classes]
+        """
+        # compute priors
+        priors = self.net(y.reshape(-1, 1)).reshape(y.size(0), y.size(1), self.n_classes)
+        return priors
+
+
+class ViterbiNetMLP(nn.Module):
+    """ViterbiNet's per-sample MLP with a configurable topology, for the
+    size/latency study. hidden_sizes=(100, 58) reproduces ViterbiNet exactly
+    (sigmoid after the first hidden layer, ReLU after the rest);
+    hidden_sizes=() is a single affine map y[t] -> 16 state scores, which is
+    the exact form of the Gaussian log-likelihood for a known channel once the
+    state-independent y^2 term is dropped."""
+    def __init__(self, hidden_sizes, n_classes: int):
+        super(ViterbiNetMLP, self).__init__()
+        self.n_classes = n_classes
+        self.input_size = 1
+        layers, width = [], 1
+        for i, h in enumerate(hidden_sizes):
+            layers += [nn.Linear(width, h), nn.Sigmoid() if i == 0 else nn.ReLU()]
+            width = h
+        layers.append(nn.Linear(width, n_classes))
+        self.net = nn.Sequential(*layers).to(device)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        return self.net(y.reshape(-1, 1)).reshape(y.size(0), y.size(1), self.n_classes)
+
+
+####################################### Transformers ##############################################
+
+
+def clones(module, n):
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(n)])
+
+
+class Encoder(nn.Module):
+    def __init__(self, layer, N):
+        super(Encoder, self).__init__()
+        self.layers = clones(layer, N)
+        self.norm = nn.LayerNorm(layer.size)
+        if N > 1:
+            self.norm2 = nn.LayerNorm(layer.size)
+
+    def forward(self, x, mask):
+        for idx, layer in enumerate(self.layers, start=1):
+            x = layer(x, mask)
+            if idx == len(self.layers)//2 and len(self.layers) > 1:
+                x = self.norm2(x)
+        return self.norm(x)
+
+
+class SublayerConnection(nn.Module):
+    def __init__(self, size, dropout):
+        super(SublayerConnection, self).__init__()
+        self.norm = nn.LayerNorm(size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, sublayer):
+        return x + self.dropout(sublayer(self.norm(x)))
+
+
+class EncoderLayer(nn.Module):
+    def __init__(self, size, self_attn, feed_forward, dropout):
+        super(EncoderLayer, self).__init__()
+        self.self_attn = self_attn
+        self.feed_forward = feed_forward
+        self.sublayer = clones(SublayerConnection(size, dropout), 2)
+        self.size = size
+
+    def forward(self, x, mask):
+        x = self.sublayer[0](x, lambda x: self.self_attn(x, x, x, mask))
+        return self.sublayer[1](x, self.feed_forward)
+
+
+class MultiHeadedAttention(nn.Module):
+    def __init__(self, h, d_model, dropout=0.1):
+        super(MultiHeadedAttention, self).__init__()
+        assert d_model % h == 0
+        self.d_k = d_model // h
+        self.h = h
+        self.linears = clones(nn.Linear(d_model, d_model), 4)
+        self.attn = None
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, query, key, value, mask=None):
+        nbatches = query.size(0)
+        query, key, value = [l(x).view(nbatches, -1, self.h, self.d_k).transpose(1, 2)
+                            for l, x in zip(self.linears, (query, key, value))]
+
+        x, self.attn = self.attention(query, key, value, mask=mask)
+
+        x = x.transpose(1, 2).contiguous().view(nbatches, -1, self.h * self.d_k)
+        return self.linears[-1](x)
+
+    def attention(self, query, key, value, mask=None):
+        d_k = query.size(-1)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+        if mask is not None:
+            scores = scores.masked_fill(mask, -1e9)
+        p_attn = F.softmax(scores, dim=-1)
+        if self.dropout is not None:
+            p_attn = self.dropout(p_attn)
+        return torch.matmul(p_attn, value), p_attn
+
+
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, d_ff, dropout=0):
+        super(PositionwiseFeedForward, self).__init__()
+        self.w_1 = nn.Linear(d_model, d_ff)
+        self.w_2 = nn.Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.w_2(self.dropout(F.gelu(self.w_1(x))))
+
+
+class ECC_Transformer(nn.Module):
+    def __init__(self, input_size, n_dim, n_heads, n_layers, n_classes, dropout=0):
+        super(ECC_Transformer, self).__init__()
+        self.input_size = input_size
+        self.n_classes = n_classes
+
+        cpy = copy.deepcopy
+        attn = MultiHeadedAttention(n_heads, n_dim)
+        ff = PositionwiseFeedForward(n_dim, n_dim*4, dropout)
+        self.input_layer = nn.Linear(input_size, n_dim, bias=False)
+        self.transformer_encoder = Encoder(EncoderLayer(n_dim, cpy(attn), cpy(ff), dropout), n_layers)
+
+        self.fc = nn.Linear(n_dim, n_classes)
+
+    def generate_square_subsequent_mask(self, size: int):
+        """Generates an upper-triangular matrix of -inf, with zeros on diag."""
+        return torch.triu(torch.ones(size, size) * float('-inf'), diagonal=1).type(torch.bool).to(device)
+
+
+    def forward(self, input_):
+        batch_size, transmission_length = input_.size(0), input_.size(1)
+
+        x = self.input_layer(input_)
+        src_mask = self.generate_square_subsequent_mask(transmission_length)
+        y = self.transformer_encoder(x, src_mask)  # src_mask = None
+        out = self.fc(y)
+        return out.reshape(batch_size, transmission_length, self.n_classes)
+
+
+class SinusoidalPositionalEncoding(nn.Module):
+    """Standard non-parametric sinusoidal position encoding (Vaswani et al.)."""
+    def __init__(self, d_model, max_len=2048):
+        super(SinusoidalPositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1)]
+
+
+class ECC_TransformerV2(nn.Module):
+    """Variant of ECC_Transformer testing 3 fixes identified as likely causes
+    of its failure to outperform ViterbiNet's MLP, all free in parameter count:
+    (1) fewer heads so d_k = d_model/h isn't degenerate (n_heads is caller-set,
+        unlike the original's hardcoded-too-high N_HEADS=8 for d_model=16),
+    (2) sinusoidal positional encoding (non-parametric) since self-attention
+        is otherwise permutation-invariant, and
+    (3) no causal mask -- the ISI channel is causal in x->y (x[t] leaks into
+        future y[t+1..t+L-1]), so a strictly-causal mask throws away exactly
+        the future context that gives Viterbi/BCJR their edge over a
+        memoryless per-sample estimator; a sequence-labeling task has no
+        autoregressive-leakage reason to mask the future the way language
+        modeling does.
+    """
+    def __init__(self, input_size, n_dim, n_heads, n_layers, n_classes, dropout=0):
+        super(ECC_TransformerV2, self).__init__()
+        self.input_size = input_size
+        self.n_classes = n_classes
+
+        cpy = copy.deepcopy
+        attn = MultiHeadedAttention(n_heads, n_dim)
+        ff = PositionwiseFeedForward(n_dim, n_dim*4, dropout)
+        self.input_layer = nn.Linear(input_size, n_dim, bias=False)
+        self.pos_encoding = SinusoidalPositionalEncoding(n_dim)
+        self.transformer_encoder = Encoder(EncoderLayer(n_dim, cpy(attn), cpy(ff), dropout), n_layers)
+
+        self.fc = nn.Linear(n_dim, n_classes)
+
+    def forward(self, input_):
+        batch_size, transmission_length = input_.size(0), input_.size(1)
+
+        x = self.input_layer(input_)
+        x = self.pos_encoding(x)
+        y = self.transformer_encoder(x, mask=None)
+        out = self.fc(y)
+        return out.reshape(batch_size, transmission_length, self.n_classes)
+
+
+class ViterbiTransformerV3(ECC_TransformerV2):
+    """TransformerV2 with the input embedding replaced by a small MLP with
+    biases (Linear -> GELU -> Linear) applied to each rolling window of
+    input_size samples. The plain bias-free linear embedding is what the
+    snr=7 ablations pointed at: adding just a bias (ViT_overlap) cut
+    TransformerV2's gap to ViterbiNet from ~22% to ~7%, and ViterbiNet itself
+    applies a nonlinearity directly to the raw sample. Everything else --
+    sinusoidal positions, bidirectional attention, 2 heads, 2 layers -- is V2.
+    """
+    def __init__(self, input_size, n_dim, n_heads, n_layers, n_classes, dropout=0):
+        super(ViterbiTransformerV3, self).__init__(input_size, n_dim, n_heads, n_layers, n_classes, dropout)
+        self.input_layer = nn.Sequential(
+            nn.Linear(input_size, n_dim),
+            nn.GELU(),
+            nn.Linear(n_dim, n_dim),
+        )
+
+
+class ViterbiTransformerV4(nn.Module):
+    """Feature extraction -> one attention layer -> feature extraction -> Viterbi.
+
+    The snr=7 attention readouts showed the second encoder layer's attention
+    stays near-uniform (96-98% of max entropy), so its ~3.3k parameters are
+    moved into nonlinear feature extraction instead:
+      * front end: a deeper MLP on each rolling window of input_size samples
+        (Linear -> GELU -> Linear -> GELU -> Linear, with biases),
+      * a single bidirectional encoder layer (sinusoidal positions, 2 heads)
+        that gathers context from neighbouring symbols, the job layer 1
+        was already doing,
+      * a per-position MLP head producing the state priors for the trellis.
+    """
+    def __init__(self, input_size, n_dim, n_heads, n_classes, hidden=40, dropout=0):
+        super(ViterbiTransformerV4, self).__init__()
+        self.input_size = input_size
+        self.n_classes = n_classes
+
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_size, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, n_dim),
+        )
+        self.pos_encoding = SinusoidalPositionalEncoding(n_dim)
+        attn = MultiHeadedAttention(n_heads, n_dim)
+        ff = PositionwiseFeedForward(n_dim, n_dim * 4, dropout)
+        self.transformer_encoder = Encoder(EncoderLayer(n_dim, attn, ff, dropout), 1)
+        self.head = nn.Sequential(
+            nn.Linear(n_dim, 2 * n_dim),
+            nn.GELU(),
+            nn.Linear(2 * n_dim, n_classes),
+        )
+
+    def forward(self, input_):
+        x = self.pos_encoding(self.feature_extractor(input_))
+        y = self.transformer_encoder(x, mask=None)
+        return self.head(y)
+
+
+class ViT1D(nn.Module):
+    """Vision-Transformer-style detector for a 1-D received block: the block is
+    cut into non-overlapping patches of patch_size samples, each patch is
+    linearly embedded (with bias) as one token, a learned positional embedding
+    is added, and a bidirectional pre-norm encoder attends across patches. The
+    head "unpatchifies" each token back into patch_size per-symbol class logits,
+    so the output has the same [batch, transmission_length, n_classes] contract
+    as ViterbiNet and feeds the same Viterbi ACS decoder.
+
+    input_size is 1: Detector hands over the raw samples y[t] and patching is
+    done here, over the whole block, instead of via Detector's rolling window.
+    """
+    def __init__(self, patch_size, n_dim, n_heads, n_layers, n_classes, mlp_ratio=3,
+                 max_tokens=40, dropout=0, overlapping=False):
+        super(ViT1D, self).__init__()
+        self.input_size = 1
+        self.n_classes = n_classes
+        self.patch_size = patch_size
+        self.max_tokens = max_tokens
+        # overlapping=True: stride-1 patches, one per symbol -- patch t is
+        # y[t-P+1..t], the same window Detector gives TransformerV2 -- with a
+        # fixed sinusoidal position encoding and a per-token head. No patch
+        # edges, nothing position-specific to memorise.
+        self.overlapping = overlapping
+
+        cpy = copy.deepcopy
+        attn = MultiHeadedAttention(n_heads, n_dim)
+        ff = PositionwiseFeedForward(n_dim, n_dim * mlp_ratio, dropout)
+        self.patch_embed = nn.Linear(patch_size, n_dim)
+        if overlapping:
+            self.pos_encoding = SinusoidalPositionalEncoding(n_dim)
+            self.head = nn.Linear(n_dim, n_classes)
+        else:
+            self.pos_embed = nn.Parameter(torch.zeros(1, max_tokens, n_dim))
+            nn.init.trunc_normal_(self.pos_embed, std=0.02)
+            self.head = nn.Linear(n_dim, patch_size * n_classes)
+        self.transformer_encoder = Encoder(EncoderLayer(n_dim, cpy(attn), cpy(ff), dropout), n_layers)
+
+    def forward(self, input_):
+        batch_size, transmission_length = input_.size(0), input_.size(1)
+        y = input_.reshape(batch_size, transmission_length)
+
+        if self.overlapping:
+            y = F.pad(y, [self.patch_size - 1, 0])
+            patches = y.unfold(1, self.patch_size, 1)  # [batch, transmission_length, patch_size]
+            x = self.pos_encoding(self.patch_embed(patches))
+            x = self.transformer_encoder(x, mask=None)
+            return self.head(x)
+
+        n_tokens = math.ceil(transmission_length / self.patch_size)
+        assert n_tokens <= self.max_tokens, f'{n_tokens} patches > max_tokens={self.max_tokens}'
+        y = F.pad(y, [0, n_tokens * self.patch_size - transmission_length])
+        patches = y.reshape(batch_size, n_tokens, self.patch_size)
+
+        x = self.patch_embed(patches) + self.pos_embed[:, :n_tokens]
+        x = self.transformer_encoder(x, mask=None)
+        out = self.head(x).reshape(batch_size, n_tokens * self.patch_size, self.n_classes)
+        return out[:, :transmission_length]
+
+
+class TRANSFORMER(nn.Module):
+    def __init__(self, input_size, n_dim, n_heads, num_layers, ff_dim, n_classes, dropout=0):
+        super(TRANSFORMER, self).__init__()
+        self.n_classes = n_classes
+        self.input_size = input_size
+        self.n_dim = n_dim
+        dropout = dropout
+
+        t_encoder = nn.TransformerEncoderLayer(
+            d_model=n_dim,
+            nhead=n_heads,
+            batch_first=True,
+            dropout=dropout,
+            dim_feedforward=ff_dim,
+            # activation=torch.sigmoid,
+            norm_first=True,
+            # layer_norm_eps=1e-6
+        ).to(device)
+        # Stack the encoder layer n times in nn.TransformerDecoder
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=t_encoder,
+            num_layers=num_layers,
+            norm=None
+        ).to(device)
+
+        self.position_layer = nn.Sequential(
+            nn.Linear(1, n_dim, bias=False),
+            # nn.Sigmoid(),
+            # nn.Linear(4*dim, dim)
+        ).to(device)
+
+        self.input_encoder_layer = nn.Sequential(nn.Linear(input_size, n_dim, bias=False),
+                                                ).to(device)
+
+        self.output_decoder_layer = nn.Sequential(nn.ReLU(),
+                                                  nn.Linear(n_dim, n_classes, bias=False)
+                                                  ).to(device)
+
+    def create_src_mask(self, size):
+        mask = (torch.triu(torch.ones(size, size)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask.to(device)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        batch_size, transmission_length = y.size(0), y.size(1)
+
+        x = self.input_encoder_layer(y)  # input (batch, 136, 4) --> out (batch, 136, 128)
+        # mask = self.create_src_mask(transmission_length)
+        x = self.transformer_encoder(x)  # input (batch, 136, 128) --> out (batch, 136, 128)
+        out = self.output_decoder_layer(x)  # input (batch, 136, 128) --> out (batch, 136, 2)  .permute(1,0,2)
+        out = out.reshape(batch_size, transmission_length, self.n_classes)
+        # out = out[:, 1:].reshape(batch_size, transmission_length-1, self.n_classes)
+        return out
+
+
+class ConvTRANSFORMER(nn.Module):
+    def __init__(self, input_size, dim, heads, n_layers, ff_dim, n_classes, dropout=0):
+        super(ConvTRANSFORMER, self).__init__()
+        self.n_classes = ff_dim
+        self.input_size = input_size
+        self.n_dim = dim
+
+        self.position_layer = nn.Linear(1, 2*dim*input_size, bias=False)
+
+        dropout = dropout
+        num_layers = n_layers
+        t_encoder = nn.TransformerEncoderLayer(
+            d_model=2*dim*input_size,
+            nhead=heads,
+            batch_first=True,
+            dropout=dropout,
+            dim_feedforward=ff_dim,
+            # activation=torch.sigmoid,
+            norm_first=True,
+            # layer_norm_eps=1e-6
+        ).to(device)
+        # Stack the encoder layer n times in nn.TransformerDecoder
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer=t_encoder,
+            num_layers=num_layers,
+            norm=None
+        ).to(device)
+
+        self.input_encoder_layer = nn.Sequential(
+            nn.ConvTranspose1d(1, dim//2, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.Sigmoid(),
+            nn.BatchNorm1d(dim//2),
+            nn.ConvTranspose1d(dim // 2, dim // 2, kernel_size=5, stride=1, padding=2, bias=False),
+            nn.ReLU(),
+            nn.BatchNorm1d(dim // 2),
+            ConvBlock(dim // 2, dim, 5, 2, False),
+            ConvBlock(dim, dim, 5, 2, False),
+            # nn.AvgPool1d(2),
+            # nn.Upsample(scale_factor=2),
+
+        ).to(device)
+
+
+        self.output_decoder_layer = nn.Sequential(
+            nn.ConvTranspose1d(dim, dim, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.ReLU(),
+            nn.BatchNorm1d(dim),
+        ).to(device)
+
+        self.fc = nn.Sequential(
+             nn.Linear(int(2*dim*self.input_size), self.n_classes, bias=False),
+
+        ).to(device)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(self.input_size, self.n_classes)
+        )
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        batch_size, transmission_length = y.size(0), y.size(1)
+
+        x = self.input_encoder_layer(y.reshape(-1, 1, self.input_size))
+        # x = self.adp(x.reshape(batch_size, transmission_length, -1))
+        out = self.transformer_encoder(x.reshape(batch_size, transmission_length, -1))
+        # out = self.output_decoder_layer(z)
+        out = self.fc(out.reshape(batch_size, transmission_length, -1))
+        out = out.reshape(batch_size, transmission_length, self.n_classes)
+
+        # x = self.transformer_encoder(x.reshape(batch_size, transmission_length, -1))  # input (batch, 136, 128) --> out (batch, 136, 128)
+        # out = self.output_decoder_layer(x)  # input (batch, 136, 128) --> out (batch, 136, 2)  .permute(1,0,2)
+        # out = out.reshape(batch_size, transmission_length, self.n_classes)
+        # out = out[:, 1:].reshape(batch_size, transmission_length-1, self.n_classes)
+        return out
+
+
+
+#######################################  Statistical Viterbi  ##############################################
+
+class ClassicViterbi(nn.Module):
+    """
+    This module implements the classic statistical Viterbi Algorithm detector
+    """
+
+    def __init__(self,
+                 n_classes: int,
+                 memory_length: int,
+                 gamma: float,
+                 val_words: int,
+                 channel_type: str,
+                 noisy_est_var: float,
+                 fading: bool,
+                 fading_taps_type: int,
+                 channel_coefficients: str,
+                 csi_uncertainty: float = 0.0):
+
+        super(ClassicViterbi, self).__init__()
+        self.memory_length = memory_length
+        self.gamma = gamma
+        self.csi_uncertainty = csi_uncertainty
+        self.val_words = val_words
+        self.n_classes = n_classes
+        self.channel_type = channel_type
+        self.noisy_est_var = noisy_est_var
+        self.fading = fading
+        self.fading_taps_type = fading_taps_type
+        self.channel_coefficients = channel_coefficients
+        self.input_size = 1
+        self.count = 0
+
+    def compute_state_priors(self, h: np.ndarray) -> torch.Tensor:
+        all_states_decimal = np.arange(self.n_classes).astype(np.uint8).reshape(-1, 1)
+        all_states_binary = np.unpackbits(all_states_decimal, axis=1).astype(int)
+        if self.channel_type == 'ISI_AWGN':
+            all_states_symbols = BPSKModulator.modulate(all_states_binary[:, -self.memory_length:])
+        else:
+            raise Exception('No such channel defined!!!')
+        state_priors = np.dot(all_states_symbols, h.T)
+        return torch.Tensor(state_priors).to(device)
+
+    def compute_likelihood_priors(self, y: torch.Tensor, count: int = None):
+        # estimate channel per word (only changes between the h's if fading is True)
+        h = np.concatenate([estimate_channel(self.memory_length, self.gamma, noisy_est_var=self.noisy_est_var,
+                                             fading=self.fading, index=index, fading_taps_type=self.fading_taps_type,
+                                             channel_coefficients=self.channel_coefficients) for index in range(self.val_words)], axis=0)
+        # CSI uncertainty: perturbs only the decoder's own belief about the
+        # channel (used below for the Viterbi metric), not the channel that
+        # actually transmitted the word -- that stays exact, generated
+        # separately in ChannelModelDataset with its own noisy_est_var (left
+        # at 0). This models a decoder mismatched against a perfect channel,
+        # not a noisier physical channel. csi_uncertainty is a fraction of
+        # each word's own channel energy (sqrt(mean(h**2)) that draw), used
+        # as the noise std applied uniformly to taps 1..L-1, matching the
+        # existing noisy_est_var convention of never perturbing tap 0.
+        if self.csi_uncertainty > 0:
+            std = self.csi_uncertainty * np.sqrt(np.mean(h ** 2, axis=1, keepdims=True))
+            h[:, 1:] += np.random.normal(0, 1, [self.val_words, self.memory_length - 1]) * std
+        if count is not None:
+            h = h[count].reshape(1, -1)
+        # compute priors
+        state_priors = self.compute_state_priors(h)
+        if self.channel_type == 'ISI_AWGN':
+            priors = y.unsqueeze(dim=2) - state_priors.T.repeat(
+                repeats=[y.shape[0] // state_priors.shape[1], 1]).unsqueeze(
+                dim=1)
+            # to llr representation
+            priors = priors ** 2 / 2 - math.log(math.sqrt(2 * math.pi))
+        else:
+            raise Exception('No such channel defined!!!')
+        return priors
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        The forward pass of the Viterbi algorithm
+        :param y: input values (batch)
+        :param snr: channel snr
+        :param gamma: channel coefficient
+        :returns priors
+        """
+        # compute transition likelihood priors
+        priors = self.compute_likelihood_priors(y.reshape(1, -1), self.count)
+        self.count += 1
+        return -priors
+
+
+class ClassicViterbiLS(ClassicViterbi):
+    """Classical Viterbi with NO channel knowledge: the L taps are estimated by
+    least squares from known symbols -- the pilot word, then every data word
+    that passes the same ECC-accepted gate ViterbiNet's online training uses
+    (decision-directed tracking). Same trellis, same Gaussian metric as
+    ClassicViterbi; only the source of h differs (estimate vs. true taps).
+    The Trainer calls ls_update(tx, rx) where learned detectors take
+    gradient steps (online_training)."""
+    online_ls = True
+
+    def __init__(self, *args, forget: float = 0.0, **kwargs):
+        super(ClassicViterbiLS, self).__init__(*args, **kwargs)
+        self.h_est = np.zeros((1, self.memory_length))
+        self.h_est[0, 0] = 1.0  # placeholder until the first pilot arrives
+        # Exponentially-weighted LS over all past known/accepted words:
+        # forget=0 uses only the latest word (plain LS); forget -> 1 approaches
+        # the long-term average channel.
+        self.forget = forget
+        self.R = np.zeros((self.memory_length, self.memory_length))
+        self.r = np.zeros(self.memory_length)
+
+    def state_symbols(self, states: np.ndarray) -> np.ndarray:
+        """Per-state tap-symbol vectors, exactly as compute_state_priors builds them."""
+        bits = np.unpackbits(states.astype(np.uint8).reshape(-1, 1), axis=1).astype(int)
+        return BPSKModulator.modulate(bits[:, -self.memory_length:])
+
+    def ls_update(self, states: torch.Tensor, rx: torch.Tensor):
+        X = self.state_symbols(states.reshape(-1).cpu().numpy())
+        y = rx.reshape(-1).cpu().numpy()[:X.shape[0]]
+        if self.forget == 0:
+            self.h_est = np.linalg.lstsq(X, y, rcond=None)[0].reshape(1, -1)
+            return
+        self.R = self.forget * self.R + X.T @ X
+        self.r = self.forget * self.r + X.T @ y
+        self.h_est = np.linalg.solve(self.R, self.r).reshape(1, -1)
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        y = y.reshape(1, -1)
+        state_priors = self.compute_state_priors(self.h_est)
+        priors = (y.unsqueeze(dim=2) - state_priors.T.unsqueeze(dim=1)) ** 2 / 2 - math.log(math.sqrt(2 * math.pi))
+        self.count += 1
+        return -priors
+
+
+class ClassicViterbiGenie(ClassicViterbi):
+    """Fast-fading reference: the classic Viterbi metric computed with the TRUE
+    per-sample taps h_t (the Trainer hands them over as `taps`, [words, T, L],
+    for every repetition). Lower bound for any receiver on a time-varying channel."""
+    needs_true_taps = True
+    taps = None
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        y = y.reshape(1, -1)
+        h = self.taps[self.count]  # [T, L]
+        state_priors = self.compute_state_priors(h)  # [n_states, T]
+        priors = (y.unsqueeze(dim=2) - state_priors.T.unsqueeze(dim=0)) ** 2 / 2 - math.log(math.sqrt(2 * math.pi))
+        self.count += 1
+        return -priors
+
+
+class ClassicViterbiPSP(ClassicViterbiLS):
+    """Classical Viterbi without CSI that TRACKS the channel inside the word:
+    per-survivor processing (Raheli et al.), each of the n_states survivors
+    keeps its own tap estimate, updated by LMS along its own path at every
+    step. Same trellis, metric and decision rule as Detector's Viterbi. A word
+    starts from the previous word's best-survivor estimate; pilot and
+    ECC-accepted words refine it (block LS, then an LMS pass over the known
+    symbols, so it ends on the channel at the END of the word)."""
+
+    def __init__(self, *args, step: float = 0.05, **kwargs):
+        super(ClassicViterbiPSP, self).__init__(*args, **kwargs)
+        self.step = step
+        self.symbols = self.state_symbols(np.arange(self.n_classes))  # [S, L]
+        s = np.arange(self.n_classes)
+        self.preds = np.stack([(2 * s) % self.n_classes, (2 * s) % self.n_classes + 1], axis=1)  # [S, 2]
+        self.h_word_start = self.h_est
+
+    def detect(self, y: torch.Tensor) -> torch.Tensor:
+        y_np = y.reshape(-1).cpu().numpy()
+        X, P, mu = self.symbols, self.preds, self.step
+        H = np.repeat(self.h_est, self.n_classes, axis=0)  # [S, L] per-survivor taps
+        self.h_word_start = self.h_est
+        in_prob = np.zeros(self.n_classes)
+        rows = np.arange(self.n_classes)
+        out = np.zeros(y_np.shape[0])
+        for i, yi in enumerate(y_np):
+            out[i] = np.argmin(in_prob) % 2
+            e = yi - np.sum(H * X, axis=1)  # each state's innovation under its own survivor's taps
+            cand = in_prob + e ** 2 / 2
+            best = P[rows, np.argmin(cand[P], axis=1)]
+            in_prob = cand[best]
+            H = H[best] + mu * e[best, None] * X[best]
+        self.h_est = H[np.argmin(in_prob)].reshape(1, -1)
+        self.count += 1
+        return torch.Tensor(out).reshape(1, -1).to(y.device)
+
+    def ls_update(self, states: torch.Tensor, rx: torch.Tensor):
+        idx = states.reshape(-1).cpu().numpy().astype(int)
+        y = rx.reshape(-1).cpu().numpy()[:idx.shape[0]]
+        X = self.symbols[idx]
+        h = np.linalg.lstsq(X, y, rcond=None)[0]
+        for x, yi in zip(X, y):
+            h = h + self.step * (yi - h @ x) * x
+        self.h_est = h.reshape(1, -1)

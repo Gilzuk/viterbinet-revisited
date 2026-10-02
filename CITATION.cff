@@ -1,0 +1,45 @@
+cff-version: 1.2.0
+message: "If you use this code or these results, please cite the papers below."
+title: "ViterbiNet Revisited: code and data"
+authors:
+  - family-names: Zukerman
+    given-names: Gil
+    affiliation: "School of Electrical Engineering, Tel Aviv University"
+    email: gilzukerman@mail.tau.ac.il
+repository-code: "https://github.com/Gilzuk/viterbinet-revisited"
+date-released: 2026-09-30
+preferred-citation:
+  type: unpublished
+  title: "ViterbiNet Revisited: A Matched-Information Classical Baseline for Learned Trellis Detection"
+  authors:
+    - family-names: Zukerman
+      given-names: Gil
+      affiliation: "School of Electrical Engineering, Tel Aviv University"
+  year: 2026
+  notes: "Manuscript to be submitted to IEEE Communications Letters"
+references:
+  - type: unpublished
+    title: "When Does Learning Help Trellis Detection? Matched Baselines, Structure, and Complexity of Model-Based Deep Viterbi Receivers"
+    authors:
+      - family-names: Zukerman
+        given-names: Gil
+    year: 2026
+    notes: "Manuscript to be submitted to IEEE Transactions on Machine Learning in Communications and Networking"
+  - type: article
+    title: "ViterbiNet: A Deep Learning Based Viterbi Algorithm for Symbol Detection"
+    authors:
+      - family-names: Shlezinger
+        given-names: Nir
+      - family-names: Farsad
+        given-names: Nariman
+      - family-names: Eldar
+        given-names: Yonina C.
+      - family-names: Goldsmith
+        given-names: Andrea J.
+    journal: "IEEE Transactions on Wireless Communications"
+    volume: 19
+    issue: 5
+    start: 3319
+    end: 3331
+    year: 2020
+    doi: 10.1109/TWC.2020.2972352

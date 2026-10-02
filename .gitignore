@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+Data_Cache/
+*.aux
+*.log
+*.blg
+*.out
+*.toc
+.idea/

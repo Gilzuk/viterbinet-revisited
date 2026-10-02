@@ -1,0 +1,825 @@
+from Code.models import ClassicViterbi, ClassicViterbiLS, ClassicViterbiGenie, ClassicViterbiPSP, ViterbiNet, LSTM, SionnaNeuralReceiver, SionnaSkip, SionnaViterbiPlus, SionnaViterbiAdd, ECC_Transformer, ECC_TransformerV2, ViterbiTransformerV3, ViterbiTransformerV4, ViT1D, ViterbiNetMLP, ADNN
+from Code.detector import Detector
+from Code.channel.channel_dataset import ChannelModelDataset
+from Code.ecc.rs_main import decode, encode
+from Code.dir_definitions import CONFIG_PATH, WEIGHTS_DIR
+from torch.nn import CrossEntropyLoss, BCELoss, MSELoss
+from torch.optim import RMSprop, Adam, SGD
+from typing import Tuple, Union
+from shutil import copyfile
+from time import time
+import numpy as np
+import yaml
+import torch
+import os
+import math
+from Code.mamba_lm import MambaLM, MambaLMConfig
+
+
+# Device will be set from main.py via the run() method
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"[Trainer Module] Initial device: {device}")
+
+INPUT_SIZE = 4    # input rolling number
+N_DIM = 16
+
+N_HEADS = 8       # for Transformers model
+N_HEADS_V2 = 2    # for TransformerV2: keeps d_k = N_DIM/N_HEADS_V2 = 8 instead of the
+                  # degenerate 2 that N_HEADS=8 gives at N_DIM=16 -- same param count
+VIT_PATCH = 4     # for ViT: samples per patch/token
+N_DIM_V3 = 64     # for TransformerV3: same 3 fixes as V2, but with parameter parity
+N_HEADS_V3 = 4    # to ViterbiNet deliberately dropped (~101k params, ~14x ViterbiNet's
+                  # ~7k) to test whether the tiny shared param budget, not the attention
+                  # configuration, was the real ceiling on TransformerV2's results.
+
+HIDDEN_SIZE = 256  # for LSTM model
+NUM_LAYERS = 2
+
+N_CLASSES = 2      # for EndToEnd method
+
+
+class Trainer(object):
+    def __init__(self, config_path=None, **kwargs):
+
+        # general
+        self.run_name = None
+
+        # Code parameters
+        self.n_symbols = None
+
+        # channel
+        self.memory_length = None
+        self.channel_type = None
+        self.channel_coefficients = None
+        self.noisy_est_var = None
+        self.csi_uncertainty = None
+        self.fading_in_channel = None
+        self.fading_in_decoder = None
+        self.fading_taps_type = None
+        self.doppler = None  # normalized f_D*T_symbol; > 0 makes the taps vary within a word
+        self.rician_k = None  # Rician K-factor of that fast fading (default 3)
+        self.psp_step = None  # LMS step of ClassicViterbi_PSP (default 0.05)
+        self.ls_forget = None  # ClassicViterbi_LS forgetting factor over past words (default 0 = last word only)
+        self.subframes_in_frame = None
+        self.gamma = None
+        self.curr_SNR = None
+        self.pilots_num = None # number of subframes between pilots
+        # validation hyperparameters
+        self.val_block_length = None
+        self.val_frames = None
+
+        # training hyperparameters
+        self.train_block_length = None
+        self.train_frames = None
+        self.train_minibatch_num = None
+        self.train_minibatch_size = None
+        self.lr = None  # learning rate
+        self.loss_type = None
+        self.optimizer_type = None
+
+        # self-supervised online training
+        self.self_supervised = None
+        self.self_supervised_iterations = None
+        self.ser_thresh = None
+        # Which words the online update may use. 'oracle' (default; the reference
+        # implementation's rule): decoded-word SER vs the TRANSMITTED bits <= ser_thresh,
+        # labels = re-encoded word if SER == 0 else the raw hard decisions. Not
+        # implementable at a receiver. 'rs': bounded-distance RS acceptance -- the
+        # re-encoded decoded word differs from the detector's hard decisions in at most
+        # n_symbols // 2 RS symbols (8-bit) -- and labels are always the re-encoded word.
+        # Uses no ground truth.
+        self.gate_mode = 'oracle'
+
+        # seed
+        self.noise_seed = None
+        self.word_seed = None
+
+        # weights dir
+        self.weights_dir = None
+
+        # detector model
+        self.model_name = None
+        self.detector_method = None
+        self.detector = None
+
+        # if any kwargs are passed, initialize the dict with them
+        self.initialize_by_kwargs(**kwargs)
+
+        # initializes all none parameters above from config
+        self.param_parser(config_path)
+
+        # initializes word and noise generator from seed
+        self.rand_gen = np.random.RandomState(self.noise_seed)
+        self.word_rand_gen = np.random.RandomState(self.word_seed)
+        self.n_states = 2 ** self.memory_length
+
+        # initialize matrices, datasets and detector
+        self.initialize_channel_data()
+        self.initialize_detector()
+
+        # calculate data subframes indices. We will calculate ser only over these values.
+        self.data_indices = torch.Tensor(list(filter(lambda x: x % self.pilots_num != 0,
+                                                     [i for i in
+                                                      range(self.val_frames * self.subframes_in_frame)]))).long()
+        #self.data_indices = torch.cat((torch.zeros(1).long(),self.data_indices))
+        print(f'model:{self.model_name}, snr:{self.curr_SNR} *** New: number of pilots for training : ',self.pilots_num)
+        #breakpoint()
+    def initialize_by_kwargs(self, **kwargs):
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+    def param_parser(self, config_path: str):
+        """
+        Parse the config, load all attributes into the trainer
+        :param config_path: path to config
+        """
+        if config_path is None:
+            config_path = CONFIG_PATH
+
+        with open(config_path) as f:
+            self.config = yaml.load(f, Loader=yaml.FullLoader)
+
+        # set attribute of Trainer with every config item
+        for k, v in self.config.items():
+            try:
+                if getattr(self, k) is None:
+                    setattr(self, k, v)
+            except AttributeError:
+                pass
+
+        if self.weights_dir is None:
+            self.weights_dir = os.path.join(WEIGHTS_DIR, self.run_name)
+            if not os.path.exists(self.weights_dir) and len(self.weights_dir):
+                os.makedirs(self.weights_dir)
+                # save config in output dir
+                copyfile(config_path, os.path.join(self.weights_dir, "configuration.yaml"))
+
+    def get_name(self):
+        return self.__name__()
+
+    def initialize_detector(self):
+        if self.detector_method != 'EndToEnd':
+            n_classes = self.n_states
+        else:
+            n_classes = N_CLASSES
+        if self.detector_method == 'Statistical' and self.model_name not in ('ClassicViterbi_LS', 'ClassicViterbi_PSP'):
+            self.self_supervised = False
+        models = {
+            'ClassicViterbi': lambda: ClassicViterbi(n_classes=n_classes,
+                                   memory_length=self.memory_length,
+                                   gamma=self.gamma,
+                                   val_words=self.val_frames * self.subframes_in_frame,
+                                   channel_type=self.channel_type,
+                                   noisy_est_var=self.noisy_est_var,
+                                   fading=self.fading_in_decoder,
+                                   fading_taps_type=self.fading_taps_type,
+                                   channel_coefficients=self.channel_coefficients,
+                                   csi_uncertainty=self.csi_uncertainty or 0.0),
+            # Classical Viterbi without CSI: taps from LS on the pilot + accepted words.
+            'ClassicViterbi_LS': lambda: ClassicViterbiLS(n_classes=n_classes,
+                                   memory_length=self.memory_length,
+                                   gamma=self.gamma,
+                                   val_words=self.val_frames * self.subframes_in_frame,
+                                   channel_type=self.channel_type,
+                                   noisy_est_var=self.noisy_est_var,
+                                   fading=self.fading_in_decoder,
+                                   fading_taps_type=self.fading_taps_type,
+                                   channel_coefficients=self.channel_coefficients,
+                                   forget=self.ls_forget or 0.0),
+            # Fast fading reference: Viterbi given the true per-sample taps.
+            'ClassicViterbi_genie': lambda: ClassicViterbiGenie(n_classes=n_classes,
+                                   memory_length=self.memory_length,
+                                   gamma=self.gamma,
+                                   val_words=self.val_frames * self.subframes_in_frame,
+                                   channel_type=self.channel_type,
+                                   noisy_est_var=self.noisy_est_var,
+                                   fading=self.fading_in_decoder,
+                                   fading_taps_type=self.fading_taps_type,
+                                   channel_coefficients=self.channel_coefficients),
+            # No CSI, per-survivor LMS channel tracking inside the trellis (PSP).
+            'ClassicViterbi_PSP': lambda: ClassicViterbiPSP(n_classes=n_classes,
+                                   memory_length=self.memory_length,
+                                   gamma=self.gamma,
+                                   val_words=self.val_frames * self.subframes_in_frame,
+                                   channel_type=self.channel_type,
+                                   noisy_est_var=self.noisy_est_var,
+                                   fading=self.fading_in_decoder,
+                                   fading_taps_type=self.fading_taps_type,
+                                   channel_coefficients=self.channel_coefficients,
+                                   step=0.05 if self.psp_step is None else self.psp_step),
+            'ViterbiNet': lambda: ViterbiNet(input_size=1, n_classes=self.n_states),
+            'LSTM': lambda: LSTM(INPUT_SIZE, HIDDEN_SIZE, NUM_LAYERS, n_classes),
+            'ADNN': lambda: ADNN(input_size=INPUT_SIZE, dim=N_DIM, n_classes=n_classes),
+            'Sionna': lambda: SionnaNeuralReceiver(input_size=1, n_input_channels=1, n_output_channels=N_DIM, n_classes=n_classes),
+            'SionnaPlus': lambda: SionnaViterbiPlus(input_size=1, n_input_channels=1, n_output_channels=N_DIM, n_classes=n_classes),
+            'SionnaAdd': lambda: SionnaViterbiAdd(input_size=1, n_input_channels=1, n_output_channels=N_DIM, n_classes=n_classes),
+            'SionnaSkip': lambda: SionnaSkip(input_size=1, n_input_channels=1, n_output_channels=N_DIM, n_classes=n_classes),
+            'Transformer': lambda: ECC_Transformer(INPUT_SIZE, N_DIM, N_HEADS, NUM_LAYERS, n_classes),
+            'TransformerV2': lambda: ECC_TransformerV2(INPUT_SIZE, N_DIM, N_HEADS_V2, NUM_LAYERS, n_classes),
+            'TransformerV3': lambda: ECC_TransformerV2(INPUT_SIZE, N_DIM_V3, N_HEADS_V3, NUM_LAYERS, n_classes),
+            # V2 + nonlinear, biased per-window embedding (MLP front end); ~7.2k params.
+            'ViterbiTransformerV3': lambda: ViterbiTransformerV3(INPUT_SIZE, N_DIM, N_HEADS_V2, NUM_LAYERS, n_classes),
+            # MLP feature extraction -> 1 attention layer -> MLP head -> Viterbi; ~6.9k params.
+            'ViterbiTransformerV4': lambda: ViterbiTransformerV4(INPUT_SIZE, N_DIM, N_HEADS_V2, n_classes),
+            # V2 fed only the current sample y[t] (input_size=1, like ViterbiNet), to test
+            # whether the 4-sample window is what holds the trellis-decoded result back.
+            'TransformerV2_in1': lambda: ECC_TransformerV2(1, N_DIM, N_HEADS_V2, NUM_LAYERS, n_classes),
+            # ViT-style: non-overlapping patches of VIT_PATCH samples as tokens (patch = channel memory).
+            'ViT': lambda: ViT1D(VIT_PATCH, N_DIM, N_HEADS_V2, NUM_LAYERS, n_classes),
+            # Overlapping (stride-1) patches + fixed sinusoidal PE; same MLP width as TransformerV2.
+            'ViT_overlap': lambda: ViT1D(VIT_PATCH, N_DIM, N_HEADS_V2, NUM_LAYERS, n_classes, mlp_ratio=4, overlapping=True),
+            'Mamba': lambda: MambaLM(MambaLMConfig(d_model=4, n_layers=12, vocab_size=n_classes,pad_vocab_size_multiple=n_classes),n_classes,input_size=4)
+
+        }
+        # 'VNet_<h1>-<h2>-...' builds ViterbiNet's MLP with those hidden sizes;
+        # 'VNet_affine' has no hidden layer (topology/latency study).
+        if self.model_name.startswith('VNet_'):
+            spec = self.model_name[len('VNet_'):]
+            hidden = () if spec == 'affine' else tuple(int(h) for h in spec.split('-'))
+            models[self.model_name] = lambda: ViterbiNetMLP(hidden, n_classes=self.n_states)
+        selected_model = models[self.model_name]().to(device)
+        model_parameters = filter(lambda p: p.requires_grad, selected_model.parameters())
+        params = sum([np.prod(p.size()) for p in model_parameters])
+        print(f"{self.model_name}: num parameters: {params}")
+        self.detector = Detector(selected_model, self.detector_method)
+
+    # configurate the optimization algorithms
+    def config_optimizer(self):
+        """
+        Sets up the optimizer and loss criterion
+        """
+        if self.optimizer_type == 'Adam':
+            self.optimizer = Adam(filter(lambda p: p.requires_grad, self.detector.model.parameters()),
+                                  lr=self.lr)
+        elif self.optimizer_type == 'SGD':
+            self.optimizer = SGD(filter(lambda p: p.requires_grad, self.detector.model.parameters()),
+                                 lr=self.lr)
+        elif self.optimizer_type == 'RMSprop':
+            self.optimizer = RMSprop(filter(lambda p: p.requires_grad, self.detector.model.parameters()),
+                                     lr=self.lr)
+        else:
+            raise NotImplementedError("No such optimizer implemented!!!")
+
+    # configurate the loss function
+    def config_criterion(self):
+        if self.loss_type == 'CrossEntropy':
+            self.criterion = CrossEntropyLoss().to(device)
+        else:
+            raise NotImplementedError("Not supported such loss function!!!")
+
+    def initialize_channel_data(self):
+        """
+        Sets up the data loader - a generator from which we draw batches, in iterations
+        """
+        self.block_lengths = {'train': self.train_block_length, 'val': self.val_block_length}
+        self.frames_per_phase = {'train': self.train_frames, 'val': self.val_frames}
+        self.transmission_lengths = {'train': self.train_block_length + 8 * self.n_symbols,
+                                     'val': self.val_block_length + 8 * self.n_symbols}
+        self.channel_dataset = {
+            phase: ChannelModelDataset(channel_type=self.channel_type,
+                                       block_length=self.block_lengths[phase],
+                                       transmission_length=self.transmission_lengths[phase],
+                                       words=self.frames_per_phase[phase] * self.subframes_in_frame,
+                                       memory_length=self.memory_length,
+                                       channel_coefficients=self.channel_coefficients,  # time_decay / cost2100
+                                       random=self.rand_gen,
+                                       word_rand_gen=self.word_rand_gen,
+                                       noisy_est_var=self.noisy_est_var,
+                                       use_ecc=True,
+                                       n_symbols=self.n_symbols,
+                                       fading_taps_type=self.fading_taps_type,
+                                       fading_in_channel=self.fading_in_channel,
+                                       fading_in_decoder=self.fading_in_decoder,
+                                       phase=phase,
+                                       doppler=self.doppler or 0.0,
+                                       rician_k=self.rician_k or 3.0) for phase in ['train', 'val']}
+
+    def run(self, run_over, num_of_rep, device_arg=None, dtype=None, use_amp=False, scaler=None) -> np.ndarray:
+        """
+        Train and evaluation in a word-by-word way
+        """
+        # Store AMP settings and update global device for use in training/evaluation
+        self.device = device_arg if device_arg is not None else torch.device("cpu")
+        self.dtype = dtype if dtype is not None else torch.float32
+        self.use_amp = use_amp
+        self.scaler = scaler
+        
+        # Update the module-level device variable so all operations use the correct device
+        if device_arg is not None:
+            global device
+            device = device_arg
+            print(f"[Trainer] Using device: {device}")
+        
+        self.load_train_weights(run_over)
+        return self.online_evaluation(num_of_rep=num_of_rep)
+
+    def train(self, on_checkpoint=None, start_minibatch=1, best_ser=math.inf,
+              on_minibatch=None):
+        """
+        Main training loop. Runs in minibatches.
+        Evaluates performance over validation SNR.
+        Saves weights given the best validation SER result.
+
+        on_checkpoint: optional no-argument callback invoked right after
+        each time improved weights are written to disk, so a caller can
+        mirror that progress elsewhere (e.g. committing it to git) without
+        this method knowing anything about that.
+
+        start_minibatch/best_ser: resume point for a run that was
+        interrupted partway through the minibatch loop -- pass the
+        minibatch to continue from and the best validation SER reached so
+        far, so the loop finishes the remaining budget instead of
+        replaying it, and does not overwrite already-better weights.
+        on_minibatch: optional callback(minibatch, best_ser) invoked after
+        every minibatch, for persisting that resume point.
+        """
+        if self.detector_method == 'Statistical':
+            raise NotImplementedError("No training implemented for Statistical decoder!!!")
+        self.config_optimizer()
+        self.config_criterion()
+
+        print(f'model:{self.model_name}, snr:{self.curr_SNR}  Start training model - {self.model_name},SNR - {self.curr_SNR}, Gamma - {self.gamma}, Channel Cost - {self.channel_coefficients}')
+        
+        from tqdm import tqdm
+        
+        # Progress bar for training minibatches
+        pbar = tqdm(range(start_minibatch, self.train_minibatch_num + 1),
+                    desc=f"🔥 Training (SNR={self.curr_SNR})",
+                    unit="batch",
+                    ncols=120,
+                    colour='green',
+                    initial=start_minibatch - 1,
+                    total=self.train_minibatch_num,
+                    bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]')
+        
+        for minibatch in pbar:
+            # draw words
+            transmitted_words, received_words = self.channel_dataset['train'].__getitem__(snr_list=[self.curr_SNR], gamma=self.gamma)
+            
+            # Ensure data is on the correct device
+            transmitted_words = transmitted_words.to(device)
+            received_words = received_words.to(device)
+
+            # run training loops
+            current_loss = 0
+            for i in range(self.train_frames * self.subframes_in_frame):  # train over one minibatch
+                # Forward pass in FP32
+                predictions = self.detector(received_words[i].reshape(1, -1), 'train')
+                current_loss += self.backpropagation(predictions, transmitted_words[i].reshape(1, -1))   # calculate loss and update weights
+                
+                # Clean up intermediate tensors to prevent memory buildup
+                del predictions
+            
+            # Clean up batch tensors
+            del transmitted_words, received_words
+
+            # evaluate performance - Symbol Error Rate
+            ser = self.evaluate()
+            
+            # Update progress bar with current metrics
+            pbar.set_postfix({
+                'loss': f'{current_loss:.4f}',
+                'SER': f'{ser:.6f}',
+                'best': f'{best_ser:.6f}'
+            })
+            
+            if ser < best_ser:
+                self.save_weights(current_loss)  # save best weights
+                best_ser = ser
+                if on_checkpoint is not None:
+                    on_checkpoint()
+            if on_minibatch is not None:
+                on_minibatch(minibatch, best_ser)
+            # stopping if SER is 0
+            if ser == 0:
+                print(f'\nmodel:{self.model_name}, snr:{self.curr_SNR} [INFO] stopping as training reached minimum of 0')
+                break
+            
+            # Free GPU memory every 10 minibatches to prevent accumulation
+            if minibatch % 10 == 0 and device.type == "cuda":
+                torch.cuda.empty_cache()
+        
+        pbar.close()
+
+        print(f'model:{self.model_name}, snr:{self.curr_SNR}Best Validation SER - {best_ser} (saved)')
+        print('*' * 50)
+
+    def backpropagation(self, predictions: torch.Tensor, transmitted_words: torch.Tensor):
+        # calculate loss
+        loss = self.calculate_loss(predictions=predictions, transmitted_words=transmitted_words)
+        # if loss is Nan inform the user
+        if torch.sum(torch.isnan(loss)):
+            print('loss value is Nan')
+            print(f'Predictions stats - min: {predictions.min()}, max: {predictions.max()}, mean: {predictions.mean()}')
+            return np.nan
+        current_loss = loss.item()
+        
+        # back propagation
+        for param in self.detector.model.parameters():
+            param.grad = None
+        
+        # Backward pass
+        loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.detector.model.parameters(), max_norm=1.0)
+        
+        self.optimizer.step()
+        
+        return current_loss
+
+    # calculate train loss
+    def calculate_loss(self, predictions: torch.Tensor, transmitted_words: torch.IntTensor) -> torch.Tensor:
+        """
+        Cross Entropy loss - distribution over states versus the gt state label
+        Works for EndToEnd / ModelBased / Statistical methodologies
+        :param predictions: [1,transmission_length,n_states], each element is a probability
+        :param transmitted_words: [1, transmission_length]
+        :return: loss value
+        """
+        if self.detector_method != "EndToEnd":
+            gt_labels = self.calculate_states(transmitted_words)
+            predictions = predictions.reshape(-1, self.n_states)
+        else:
+            gt_labels = transmitted_words.long().reshape(-1)
+            predictions = predictions.reshape(-1, 2)
+        gt_labels_batch, input_batch = self.select_batch(gt_labels, predictions)
+        loss = self.criterion(input=input_batch, target=gt_labels_batch)
+        return loss
+
+    def calculate_states(self, transmitted_words: torch.Tensor) -> torch.Tensor:
+        """
+        calculates the state for the transmitted words
+        :param transmitted_words: channel transmitted words
+        :return: vector of length of transmitted_words with values in the range of 0,1,...,n_states-1
+        """
+        padded = torch.cat([transmitted_words, torch.zeros([transmitted_words.shape[0], self.memory_length]).to(device)],dim=1)
+        unsqueezed_padded = padded.unsqueeze(dim=1)
+        blockwise_words = torch.cat([unsqueezed_padded[:, :, i:-self.memory_length + i] for i in range(self.memory_length)], dim=1)
+        states_enumerator = (2 ** torch.arange(self.memory_length)).reshape(1, -1).float().to(device)
+        gt_states = torch.sum(blockwise_words.transpose(1, 2).reshape(-1, self.memory_length) * states_enumerator, dim=1).long()
+        return gt_states
+
+    def evaluate(self) -> float:
+        """
+        Evaluation at a single snr.
+        :return: ser for mini-batch
+        """
+        import time
+        from Code.dir_definitions import VERBOSE
+        
+        # STEP 1: Load data from cache/dataset
+        if VERBOSE:
+            print(f"  [Eval] Loading validation data... (CPU/Disk)")
+        load_start = time.time()
+        transmitted_words, received_words = self.channel_dataset['val'].__getitem__(snr_list=[self.curr_SNR], gamma=self.gamma)
+        load_time = time.time() - load_start
+        
+        # STEP 2: Move data to GPU
+        if VERBOSE:
+            print(f"  [Eval] Moving data to GPU... (CPU→GPU, loaded in {load_time:.2f}s)")
+        gpu_transfer_start = time.time()
+        transmitted_words = transmitted_words.to(device)
+        received_words = received_words.to(device)
+        gpu_transfer_time = time.time() - gpu_transfer_start
+        
+        if device.type == "cuda" and VERBOSE:
+            gpu_mem_after_load = torch.cuda.memory_allocated(0) / 1024**3
+            print(f"  [Eval] Data on GPU (transfer: {gpu_transfer_time:.2f}s, GPU mem: {gpu_mem_after_load:.2f} GB)")
+
+        # Dynamically determine chunk size based on available GPU memory
+        if device.type == "cuda":
+            # Get available GPU memory in GB
+            gpu_memory_available = (torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)) / 1024**3
+            total_samples = len(received_words)
+            
+            # Estimate: if we have > 4GB free, process all at once; otherwise chunk
+            if gpu_memory_available > 4.0:
+                chunk_size = total_samples  # Process all at once
+            elif gpu_memory_available > 2.5:
+                chunk_size = max(100, total_samples // 2)  # Process in 2 chunks
+            elif gpu_memory_available > 1.5:
+                chunk_size = max(50, total_samples // 3)  # Process in 3 chunks
+            else:
+                chunk_size = min(25, total_samples)  # Small chunks for low memory
+            
+            if VERBOSE:
+                print(f"  [Eval] Processing {total_samples} samples in chunks of {chunk_size} ({gpu_memory_available:.2f} GB free)")
+        else:
+            chunk_size = len(received_words)  # CPU - no memory constraints
+        
+        # STEP 3: GPU inference
+        if VERBOSE:
+            print(f"  [Eval] Running model inference... (GPU)")
+        inference_start = time.time()
+        all_detected_words = []
+        
+        with torch.no_grad():
+            for i in range(0, len(received_words), chunk_size):
+                chunk = received_words[i:i+chunk_size]
+                detected_chunk = self.detector(chunk, 'val')
+                all_detected_words.append(detected_chunk.cpu())  # Move to CPU immediately
+                del detected_chunk, chunk
+        
+        inference_time = time.time() - inference_start        
+        detected_words = torch.cat(all_detected_words, dim=0)
+        print(f"  [Eval] Inference complete (GPU, {inference_time:.2f}s, results moved to CPU)")
+
+        # STEP 4: Decode and move back for SER calculation
+        print(f"  [Eval] Decoding and calculating SER... (CPU→GPU)")
+        decode_start = time.time()
+        decoded_words = [decode(detected_word, self.n_symbols) for detected_word in detected_words.numpy()]  # CPU
+        detected_words = torch.Tensor(np.array(decoded_words)).to(device)  # Back to GPU
+
+        ser, fer, err_indices, total_bits, error_bits = self.calculate_error_rates(detected_words[self.data_indices], transmitted_words[self.data_indices])  # GPU
+        decode_time = time.time() - decode_start
+        print(f"  [Eval] SER calculation complete (GPU, {decode_time:.2f}s, SER={ser:.6f}, Errors={error_bits}/{total_bits})")
+        
+        # Clean up
+        del transmitted_words, received_words, detected_words, all_detected_words
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        
+        total_time = load_time + gpu_transfer_time + inference_time + decode_time
+        print(f"  [Eval] Total evaluation time: {total_time:.2f}s")
+        
+        # Store bit statistics in trainer for reporting
+        self.last_eval_total_bits = total_bits
+        self.last_eval_error_bits = error_bits
+        
+        return ser
+
+    def calculate_error_rates(self, prediction: torch.Tensor, target: torch.Tensor) -> Tuple[float, float, torch.Tensor, int, int]:
+        """
+        Returns the ber, fer, error indices, total bits, and error count
+        """
+        prediction = prediction.long()
+        target = target.long()
+        
+        # Calculate total bits and errors
+        total_bits = prediction.numel()
+        error_bits = torch.sum(torch.abs(prediction - target)).item()
+        
+        bits_acc = torch.mean(torch.eq(prediction, target).float()).item()
+        all_bits_sum_vector = torch.sum(torch.abs(prediction - target), 1).long()
+        frames_acc = torch.eq(all_bits_sum_vector, torch.LongTensor(1).fill_(0).to(device=device)).float().mean().item()
+        
+        return max([1 - bits_acc, 0.0]), max([1 - frames_acc, 0.0]), torch.nonzero(all_bits_sum_vector, as_tuple=False).reshape(-1), total_bits, error_bits
+
+    def online_evaluation(self, num_of_rep=1) -> Union[float, np.ndarray]:
+        print(f'model:{self.model_name}, snr:{self.curr_SNR}, Start online evaluation using {num_of_rep} repetitions')
+        
+        from tqdm import tqdm
+        
+        if self.self_supervised and not getattr(self.detector.model, 'online_ls', False):
+            # Idempotent: a caller running online_evaluation in several
+            # smaller batches on the same trainer (e.g. an adaptive
+            # run-until-enough-errors loop) keeps one optimizer/criterion
+            # across all of them, instead of losing Adam's momentum state
+            # to a fresh optimizer at the start of every batch.
+            if getattr(self, 'optimizer', None) is None:
+                self.config_optimizer()
+            if getattr(self, 'criterion', None) is None:
+                self.config_criterion()
+        total_ser = 0
+        first_run = True
+        
+        # Progress bar for repetitions
+        rep_pbar = tqdm(range(0, num_of_rep), 
+                       desc=f"📊 Eval Reps (SNR={self.curr_SNR})",
+                       unit="rep",
+                       ncols=120,
+                       colour='cyan',
+                       bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {postfix}]')
+        
+        for rep in rep_pbar:
+            # Some detectors (e.g. ClassicViterbi) track a per-word index into
+            # this rep's channel estimate array internally; it must be reset
+            # at the start of every repetition or it runs past the array
+            # bounds from num_of_rep=2 onward.
+            if hasattr(self.detector, 'model') and hasattr(self.detector.model, 'count'):
+                self.detector.model.count = 0
+
+            # A persistent, ever-increasing counter (not the `rep` loop
+            # variable, which restarts at 0 on every call to this method) so
+            # each repetition gets an independently-generated draw instead of
+            # every call with the same (snr, gamma, phase, ...) hitting the
+            # same cache entry and replaying byte-identical data -- which
+            # silently collapses "N repetitions" into one repetition
+            # measured N times, with zero actual Monte-Carlo variance.
+            self._eval_rep_counter = getattr(self, '_eval_rep_counter', 0)
+            # draw words of given gamma for all SNRs
+            transmitted_words, received_words = self.channel_dataset['val'].__getitem__(
+                snr_list=[self.curr_SNR], gamma=self.gamma, rep=self._eval_rep_counter)
+            self._eval_rep_counter += 1
+            if getattr(self.detector.model, 'needs_true_taps', False):
+                self.detector.model.taps = self.channel_dataset['val'].last_taps
+
+            # Ensure data is on the correct device
+            transmitted_words = transmitted_words.to(device)
+            received_words = received_words.to(device)
+
+            # received_words = self.get_overlapping_rx(received_words)
+            if first_run:
+                ser_by_word = np.zeros(num_of_rep*transmitted_words.shape[0])
+                first_run = False
+
+            for count, (transmitted_word, received_word) in enumerate(zip(transmitted_words, received_words)):
+                transmitted_word, received_word = transmitted_word.reshape(1, -1), received_word.reshape(1, -1)
+                # detect
+                with torch.no_grad():
+                    detected_word = self.detector(received_word, 'val')
+                        
+                if count in self.data_indices:
+                    # decode
+                    decoded_word = [decode(detected_word, self.n_symbols) for detected_word in detected_word.cpu().numpy()]
+                    decoded_word = torch.Tensor(np.array(decoded_word)).to(device)
+                    # calculate accuracy
+                    ser, fer, err_indices, word_total_bits, word_error_bits = self.calculate_error_rates(decoded_word, transmitted_word)
+                    # encode word again
+                    decoded_word_array = decoded_word.int().cpu().numpy()
+                    encoded_word = torch.Tensor(encode(decoded_word_array, self.n_symbols).reshape(1, -1)).to(device)
+                    errors_num = torch.sum(torch.abs(encoded_word - detected_word)).item()
+                    #print(f'{"*" * 35}\nCurrent word: {rep*transmitted_words.shape[0] + count, ser, errors_num}')
+                    total_ser += ser
+                    ser_by_word[rep*transmitted_words.shape[0] + count] = ser
+                else:
+                    #print(f'{"*" * 35}\nCurrent word: {rep*transmitted_words.shape[0] + count}, Pilot')
+                    # encode word again
+                    decoded_word_array = transmitted_word.int().cpu().numpy()
+                    encoded_word = torch.Tensor(encode(decoded_word_array, self.n_symbols).reshape(1, -1)).to(device)
+                    ser = 0
+                    errors_num = 0
+                
+                # Update progress bar with running average SER
+                if (rep * transmitted_words.shape[0] + count + 1) > 0:
+                    avg_ser = total_ser / max(1, (rep * len(self.data_indices) + sum(1 for c in range(count+1) if c in self.data_indices)))
+                    rep_pbar.set_postfix({'avg_SER': f'{avg_ser:.6f}'})
+                
+                # Only the most recently buffered word is ever read (by the
+                # online_training call just below -- it took buffer_*[-1]),
+                # so keep just that word instead of growing a tensor with
+                # torch.cat on every clean one. The old buffers copied their
+                # whole contents per word, making evaluation O(words^2) and
+                # unusably slow exactly where almost every word passes the
+                # threshold, i.e. at high SNR: measured ~2h per repetition at
+                # snr=7 against ~20s at snr=6. Same values, no accumulation.
+                if count in self.data_indices:   # bookkeeping only: never used for a decision
+                    st = self.__dict__.setdefault('gate_stats', {'data_words': 0, 'accepted': 0, 'wrong_labels': 0})
+                    st['data_words'] += 1
+                if self.gate_mode == 'rs':
+                    if count in self.data_indices:
+                        diff = (encoded_word.reshape(-1) != detected_word.reshape(-1)).reshape(-1, 8)
+                        accept = int(diff.any(dim=1).sum().item()) <= self.n_symbols // 2
+                    else:
+                        accept = True   # pilot: known word
+                    label = encoded_word.reshape(1, -1)
+                else:
+                    accept = ser <= self.ser_thresh
+                    label = detected_word.reshape(1, -1) if ser > 0 else encoded_word.reshape(1, -1)
+                if accept and count in self.data_indices:
+                    true_label = torch.Tensor(encode(transmitted_word.int().cpu().numpy(), self.n_symbols).reshape(1, -1)).to(device)
+                    st['accepted'] += 1
+                    st['wrong_labels'] += int(not torch.equal(label.reshape(-1), true_label.reshape(-1)))
+                if accept:
+                    last_rx = received_word
+                    last_tx = label
+
+                    if self.self_supervised:
+                        # use last word inserted in the buffer for training
+                        self.online_training(last_tx.reshape(1, -1), last_rx.reshape(1, -1))
+
+                if (count + 1) % 300 == 0:
+                    print(f'model:{self.model_name}, snr:{self.curr_SNR} , Self-supervised: {rep*transmitted_words.shape[0] + count + 1}/{transmitted_words.shape[0] * num_of_rep}, Average SER {total_ser / (rep*transmitted_words.shape[0] + count + 1)}')
+
+        
+        rep_pbar.close()
+        
+        total_ser /= (transmitted_words.shape[0] * num_of_rep)
+        print(f'model: {self.model_name}, SNR: {self.curr_SNR}, Final SER: {total_ser}')
+        return ser_by_word
+
+    def online_evaluation_(self) -> Union[float, np.ndarray]:
+        print(f'Start online evaluation for model {self.model_name} @ snr {self.curr_SNR}')
+        if self.self_supervised:
+            self.config_optimizer()
+            self.config_criterion()
+        total_ser = 0
+        # draw words of given gamma for all SNRs
+        transmitted_words, received_words = self.channel_dataset['val'].__getitem__(snr_list=[self.curr_SNR], gamma=self.gamma)
+
+        # received_words = self.get_overlapping_rx(received_words)
+
+        ser_by_word = np.zeros(transmitted_words.shape[0])
+        # query for all detected words
+        buffer_rx = torch.empty([0, received_words.shape[1]]).to(device)
+        buffer_tx = torch.empty([0, received_words.shape[1]]).to(device)
+        buffer_ser = torch.empty([0]).to(device)
+
+        for count, (transmitted_word, received_word) in enumerate(zip(transmitted_words, received_words)):
+            transmitted_word, received_word = transmitted_word.reshape(1, -1), received_word.reshape(1, -1)
+            # detect
+            # self.detector.model.eval()
+            detected_word = self.detector(received_word, 'val')
+            if count in self.data_indices:
+                # decode
+                decoded_word = [decode(detected_word, self.n_symbols) for detected_word in detected_word.cpu().numpy()]
+                decoded_word = torch.Tensor(np.array(decoded_word)).to(device)
+                # calculate accuracy
+                ser, fer, err_indices, word_total_bits, word_error_bits = self.calculate_error_rates(decoded_word, transmitted_word)
+                # encode word again
+                decoded_word_array = decoded_word.int().cpu().numpy()
+                encoded_word = torch.Tensor(encode(decoded_word_array, self.n_symbols).reshape(1, -1)).to(device)
+                errors_num = torch.sum(torch.abs(encoded_word - detected_word)).item()
+                print(f'model:{self.model_name}, snr:{self.curr_SNR}  {"*" * 35}\nCurrent word: {count, ser, errors_num}')
+                total_ser += ser
+                ser_by_word[count] = ser
+            else:
+                print(f'model:{self.model_name}, snr:{self.curr_SNR}  {"*" * 35}\nCurrent word: {count}, Pilot')
+                # encode word again
+                decoded_word_array = transmitted_word.int().cpu().numpy()
+                encoded_word = torch.Tensor(encode(decoded_word_array, self.n_symbols).reshape(1, -1)).to(device)
+                ser = 0
+                errors_num = 0
+            # save the encoded word in the buffer
+            if ser <= self.ser_thresh:
+                buffer_rx = torch.cat([buffer_rx, received_word])
+                buffer_tx = torch.cat([buffer_tx,
+                                       detected_word.reshape(1, -1) if ser > 0 else
+                                       encoded_word.reshape(1, -1)],dim=0)
+                buffer_ser = torch.cat([buffer_ser, torch.FloatTensor([ser]).to(device)])
+
+            if self.self_supervised and ser <= self.ser_thresh:
+                # use last word inserted in the buffer for training
+                self.online_training(buffer_tx[-1].reshape(1, -1), buffer_rx[-1].reshape(1, -1))
+
+            if (count + 1) % 10 == 0:
+                print(f'model: {self.model_name}, snr: {self.curr_SNR}, Self-supervised: {count + 1}/{transmitted_words.shape[0]}, Average SER {total_ser / (count + 1)}')
+
+        total_ser /= transmitted_words.shape[0]
+        print(f'model: {self.model_name}, snr: {self.curr_SNR}, SER: {total_ser}')
+        return ser_by_word
+
+    def online_training(self, tx: torch.Tensor, rx: torch.Tensor):
+        """
+        Online training module - train on the detected/re-encoded word only if the ser is below some threshold.
+        Start from the saved meta-trained weights.
+        :param tx: transmitted word
+        :param rx: received word
+        """
+        if getattr(self.detector.model, 'online_ls', False):
+            # classical receiver: re-estimate the taps by LS instead of gradient steps
+            self.detector.model.ls_update(self.calculate_states(tx), rx)
+            return
+        # run training loops
+        for i in range(self.self_supervised_iterations):
+            # calculate soft values
+            predictions = self.detector(rx, 'train')
+            self.backpropagation(predictions=predictions, transmitted_words=tx)
+
+    def select_batch(self, gt_examples: torch.LongTensor, predictions: torch.Tensor) -> Tuple[
+        torch.LongTensor, torch.Tensor]:
+        """
+        Select a batch from the input and gt labels
+        :param gt_examples: training labels
+        :param predictions: the soft approximation, distribution over states (per word)
+        :return: selected batch from the entire "epoch", contains both labels and the NN soft approximation
+        """
+        rand_ind = torch.multinomial(torch.arange(gt_examples.shape[0]).float(),
+                                     self.train_minibatch_size).long().to(device)
+        return gt_examples[rand_ind], predictions[rand_ind]
+
+    def save_weights(self, current_loss: float):
+        torch.save({'model_state_dict': self.detector.model.state_dict(),
+                    'optimizer_state_dict': self.optimizer.state_dict(),
+                    'loss': current_loss},
+                   os.path.join(self.weights_dir, f'snr_{self.curr_SNR}_gamma_{self.gamma}.pt'))
+
+    def load_train_weights(self, run_over):
+        """
+        Loads detector's weights defined by the [snr,gamma] from checkpoint, if exists else start training
+        """
+        if self.detector_method == 'Statistical':
+            print(f'model: {self.model_name} @ snr :{self.curr_SNR} , Statistical model without weights!')
+        else:
+            if run_over > 2 or run_over < 0:
+                raise ValueError("run_over value out of range 0 - 2 !!!")
+            if os.path.join(self.weights_dir, f'snr_{self.curr_SNR}_gamma_{self.gamma}.pt'):
+                print(f'loading model from SNR {self.curr_SNR} and gamma {self.gamma}')
+                weights_path = os.path.join(self.weights_dir, f'snr_{self.curr_SNR}_gamma_{self.gamma}.pt')
+                if not os.path.isfile(weights_path) or run_over == 2:
+                    # if weights do not exist, train on the synthetic channel. Then validate on the test channel.
+                    self.fading_taps_type = 1
+                    os.makedirs(self.weights_dir, exist_ok=True)
+                    self.train()
+                    self.fading_taps_type = 2
+                checkpoint = torch.load(weights_path)
+                try:
+                    self.detector.model.load_state_dict(checkpoint['model_state_dict'])
+                except Exception:
+                    raise ValueError("Wrong run directory!!!")
+            else:
+                print(f'model:{self.model_name} @ snr {self.curr_SNR}, No checkpoint for SNR {self.curr_SNR} and gamma {self.gamma} in run "{self.run_name}", starting from scratch')
+
+
+
